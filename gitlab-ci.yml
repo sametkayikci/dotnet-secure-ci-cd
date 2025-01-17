@@ -1,0 +1,138 @@
+stages:
+- build
+- security-scan
+- secrets
+- security-report
+- test
+- deploy
+
+build:
+  stage: build
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  before_script:
+    - apt-get update && apt-get install -y jq
+  script:
+    - echo "Building .NET Core Project"
+    - dotnet restore
+    - dotnet build --configuration Release
+  allow_failure: false
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+# SAST Scan
+sast:
+  stage: security-scan
+  variables:
+    SAST_FAIL_ON_SEVERITY: "high"  # Bu şekilde high seviyesinde pipeline durur
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+  allow_failure: false 
+
+
+# Dependency Scanning
+dependency_scanning:
+  stage: security-scan
+  variables:
+    SECURE_LOG_LEVEL: debug
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+  allow_failure: false
+
+# Secret Detection
+secret_detection:
+  stage: secrets
+  variables:
+    SECURE_LOG_LEVEL: debug
+  artifacts:
+    reports:
+      secret_detection: gl-secret-detection-report.json
+  allow_failure: false
+
+# Infrastructure as Code (IaC) SAST using KICS
+sast-iac:
+  stage: security-scan
+  image: registry.gitlab.com/security-products/kics:latest
+  script:
+    - echo "Running Infrastructure as Code Security Analysis with KICS"
+    - mkdir -p kics_reports
+    - |
+      # Disable immediate exit on error
+      set +e
+
+      # Run the KICS scan and fail only on critical and high severities
+      kics scan -p . \
+        -o kics_reports \
+        --output-name kics_sast_report \
+        --report-formats json \
+        --fail-on critical,high
+
+      # Capture the exit code
+      SCAN_EXIT_CODE=$?
+
+      # Re-enable immediate exit on error
+      set -e
+
+      # List the KICS report
+      echo "Listing files in kics_reports"
+      ls -l kics_reports
+
+      # If vulnerabilities are found, print message and exit with code 50
+      if [ $SCAN_EXIT_CODE -eq 50 ]; then
+        echo "Security vulnerabilities detected!!!"
+        exit 50
+      else
+        echo "No vulnerabilities found"
+      fi
+  artifacts:
+    reports:
+      sast: kics_reports/kics_sast_report.json
+  allow_failure: false
+
+
+# Security Findings Check
+check_security_findings:
+  stage: security-report
+  script:
+    # SAST report check for critical and high severity
+    - if [ -f gl-sast-report.json ]; then
+        cat gl-sast-report.json
+        cat gl-sast-report.json | jq '.vulnerabilities[] | select(.severity == "high" or .severity == "critical")' && exit 1 || echo "No critical or high SAST issues found";
+      else
+        echo "SAST report not found";
+      fi
+
+    # Dependency Scanning report check for high and critical severity
+    - if [ -f gl-dependency-scanning-report.json ]; then
+        cat gl-dependency-scanning-report.json | jq '.vulnerabilities[] | select(.severity == "critical" or .severity == "high")' && exit 1 || echo "No critical or high Dependency Scanning issues found";
+      else
+        echo "Dependency Scanning report not found";
+      fi
+
+    # Secret Detection report check for critical and high severity
+    - if [ -f gl-secret-detection-report.json ]; then
+        cat gl-secret-detection-report.json | jq '.secrets[] | select(.severity == "critical" or .severity == "high")' && exit 1 || echo "No critical or high secrets found";
+      else
+        echo "Secret Detection report not found";
+      fi
+
+    # SAST-IaC report check for critical and high severity
+    - if [ -f kics-report.json ]; then
+        cat kics-report.json | jq '.vulnerabilities[] | select(.severity == "critical" or .severity == "high")' && exit 1 || echo "No critical or high IaC issues found";
+      else
+        echo "SAST-IaC report not found";
+      fi
+  allow_failure: false
+
+# Deployment Protection: Blocking deploy if security findings are present
+protect_master:
+  stage: deploy
+  script:
+    - echo "Merging is protected due to security issues."
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_success
